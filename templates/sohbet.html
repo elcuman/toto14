@@ -16,7 +16,7 @@
 <section class="sohbet">
   <div id="mesajListesi" class="mesaj-listesi" aria-live="polite">
     <div id="bosMesaj" class="sohbet-bos" {% if mesajlar %}hidden{% endif %}>
-      <strong>Henüz mesaj yok.</strong>Maç yorumunu ilk sen yaz.
+      <strong>Henüz mesaj yok.</strong>Maç yorumunu ilk sen yaz. Bir mesajı yanıtlamak için sağa kaydır.
     </div>
   </div>
 
@@ -38,7 +38,7 @@
 
 <style>
 .sohbet{background:var(--kart); border:1px solid var(--cizgi); border-radius:var(--r-buyuk); overflow:hidden}
-.mesaj-listesi{height:min(62vh, 600px); overflow-y:auto; display:flex; flex-direction:column; gap:6px; padding:16px; background:var(--zemin)}
+.mesaj-listesi{height:min(62vh, 600px); overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; gap:6px; padding:16px; background:var(--zemin)}
 @media (max-width:640px){ .mesaj-listesi{height:calc(100vh - 320px); min-height:280px} }
 .sohbet-bos{margin:auto; color:var(--gri); text-align:center; font-size:15px}
 .sohbet-bos strong{display:block; color:var(--murekkep)}
@@ -57,6 +57,17 @@
 .mesaj-formu textarea{flex:1; resize:none; margin:0; max-height:120px; border-radius:var(--r)}
 .mesaj-yanitla{background:none; border:0; padding:0 2px; cursor:pointer; color:inherit; opacity:.6; font-size:13px; font-weight:600}
 .mesaj-yanitla:hover{opacity:1}
+/* Sağa kaydırarak yanıtla */
+.mesaj{position:relative; touch-action:pan-y; transition:transform .2s ease}
+.mesaj.surukleniyor{transition:none; user-select:none; -webkit-user-select:none}
+.mesaj .kaydir-ikon{position:absolute; left:-34px; top:50%; width:26px; height:26px; margin-top:-13px; border-radius:50%;
+  background:var(--cim); color:#fff; display:flex; align-items:center; justify-content:center; opacity:0; transform:scale(.6);
+  transition:opacity .1s, transform .1s; pointer-events:none}
+.mesaj .kaydir-ikon svg{width:15px; height:15px}
+.mesaj.esik .kaydir-ikon{transform:scale(1)}
+/* Dokunmatik ekranda yazılı düğme yok, kaydırma var; farede düğme üstüne gelince görünür */
+@media (hover:none){ .mesaj-yanitla{display:none} }
+@media (hover:hover){ .mesaj .mesaj-yanitla{opacity:0} .mesaj:hover .mesaj-yanitla, .mesaj-yanitla:focus-visible{opacity:.7} }
 .mesaj-ust .bosluk{margin-left:auto}
 .alinti{display:block; width:100%; text-align:left; margin:4px 0 6px; padding:5px 9px; border:0; border-left:3px solid var(--cim);
   background:var(--cim-acik); border-radius:6px; font:inherit; font-size:13.5px; line-height:1.3; color:var(--murekkep); cursor:pointer}
@@ -166,7 +177,55 @@
       d.appendChild(al);
     }
     d.appendChild(ic);
+    var ikon = document.createElement('span'); ikon.className = 'kaydir-ikon'; ikon.setAttribute('aria-hidden', 'true');
+    ikon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v3"/></svg>';
+    d.appendChild(ikon);
+    kaydirmaBagla(d, m);
     liste.appendChild(d);
+  }
+
+  // Mesajı sağa kaydırınca yanıtla (dokunmatik ve fare sürükleme)
+  var KAYDIR_ESIK = 56, KAYDIR_MAKS = 84;
+  function kaydirmaBagla(el, m){
+    var basX = 0, basY = 0, dx = 0, durum = null, pid = null;
+    el.addEventListener('pointerdown', function(e){
+      if (e.button > 0 || e.target.closest('button')) return;
+      basX = e.clientX; basY = e.clientY; dx = 0; durum = 'bekle'; pid = e.pointerId;
+    });
+    el.addEventListener('pointermove', function(e){
+      if (!durum || e.pointerId !== pid) return;
+      var x = e.clientX - basX, y = e.clientY - basY;
+      if (durum === 'bekle') {
+        if (Math.abs(y) > 10 && Math.abs(y) > Math.abs(x)) { durum = null; return; }   // dikey kaydırma: sayfayı kaydır
+        if (x > 10 && x > Math.abs(y)) {
+          durum = 'yatay'; el.classList.add('surukleniyor');
+          try { el.setPointerCapture(pid); } catch (err) {}
+        } else return;
+      }
+      dx = Math.max(0, Math.min(KAYDIR_MAKS, x));
+      el.style.transform = 'translateX(' + dx + 'px)';
+      var ikon = el.querySelector('.kaydir-ikon');
+      if (ikon) ikon.style.opacity = Math.min(1, dx / KAYDIR_ESIK);
+      var gecti = dx >= KAYDIR_ESIK;
+      if (gecti && !el.classList.contains('esik') && navigator.vibrate) { try { navigator.vibrate(12); } catch (err) {} }
+      el.classList.toggle('esik', gecti);
+      e.preventDefault();
+    });
+    function bitir(){
+      if (durum === 'yatay') {
+        if (dx >= KAYDIR_ESIK) yanitBaslat(m);
+        el.dataset.yeniSuruklendi = '1';
+        setTimeout(function(){ delete el.dataset.yeniSuruklendi; }, 350);
+      }
+      durum = null; dx = 0;
+      el.classList.remove('surukleniyor', 'esik');
+      el.style.transform = '';
+      var ikon = el.querySelector('.kaydir-ikon'); if (ikon) ikon.style.opacity = '';
+    }
+    el.addEventListener('pointerup', bitir);
+    el.addEventListener('pointercancel', bitir);
+    // Sürükleme sonrası oluşan tıklama, alıntıya/düğmeye basılmış sayılmasın
+    el.addEventListener('click', function(e){ if (el.dataset.yeniSuruklendi) { e.stopPropagation(); e.preventDefault(); } }, true);
   }
 
   var yanitCubugu = document.getElementById('yanitCubugu');
