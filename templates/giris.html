@@ -3,77 +3,24 @@
 {% block title %}Giriş · Tahmin Ligi{% endblock %}
 
 {% block content %}
+<div class="giris-alani">
+  <div class="giris-bas">
+    <h1>Tahmin Ligi</h1>
+    <p class="alt sessiz">Maç başlamadan skoru tahmin et, arkadaşlarınla puan yarışına gir.</p>
+  </div>
 
-<div class="min-h-[75vh] flex items-center justify-center">
+  <section class="panel">
+    <h2>Giriş yap</h2>
+    <form method="POST">
+      <label for="kullanici_adi">Kullanıcı adı</label>
+      <input id="kullanici_adi" name="kullanici_adi" required autocomplete="username" autocapitalize="none">
+      <label for="sifre">Şifre</label>
+      <input id="sifre" type="password" name="sifre" required autocomplete="current-password">
+      <button type="submit" class="btn btn-blok">Giriş yap</button>
+    </form>
+  </section>
 
-    <div class="w-full max-w-md">
-
-        <div class="text-center mb-8">
-
-            <div class="w-16 h-16 mx-auto rounded-2xl bg-green-500/10 border border-green-500/20 flex items-center justify-center mb-5">
-
-                <i data-lucide="trophy" class="w-8 h-8 text-green-400"></i>
-
-            </div>
-
-            <h1 class="text-3xl font-bold">
-                Tekrar hoş geldin
-            </h1>
-
-            <p class="text-zinc-500 mt-2">
-                Tahmin ligine giriş yap.
-            </p>
-
-        </div>
-
-
-        <div class="glass rounded-2xl p-6 sm:p-8">
-
-            <form method="POST">
-
-                <label class="text-sm text-zinc-400">
-                    Kullanıcı adı
-                </label>
-
-                <input name="kullanici_adi"
-                       required
-                       autocomplete="username"
-                       class="mt-2 mb-5 w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 outline-none focus:border-green-500">
-
-
-                <label class="text-sm text-zinc-400">
-                    Şifre
-                </label>
-
-                <input type="password"
-                       name="sifre"
-                       required
-                       autocomplete="current-password"
-                       class="mt-2 w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 outline-none focus:border-green-500">
-
-
-                <button class="mt-6 w-full py-3 rounded-xl bg-green-500 text-black font-bold hover:bg-green-400">
-                    Giriş Yap
-                </button>
-
-            </form>
-
-
-            <div class="text-center text-sm text-zinc-500 mt-6">
-
-                Hesabın yok mu?
-
-                <a href="{{ url_for('kayit') }}"
-                   class="text-green-400 hover:text-green-300">
-                    Kayıt ol
-                </a>
-
-            </div>
-
-        </div>
-
-    </div>
-
+  <p class="giris-alt">Hesabın yok mu? <a href="{{ url_for('kayit', next=request.args.get('next')) if request.args.get('next') else url_for('kayit') }}">Kayıt ol</a></p>
 </div>
-
+{% include "_giris_stil.html" %}
 {% endblock %}

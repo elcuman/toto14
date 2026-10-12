@@ -1,163 +1,94 @@
 {% extends "base.html" %}
+{% import "_parcalar.html" as p with context %}
+
+{% block title %}Ana sayfa · Tahmin Ligi{% endblock %}
 
 {% block content %}
 
-<h1>Dashboard</h1>
+{% set bekleyen = yaklasan_maclar | rejectattr('id', 'in', tahminler.keys() | list) | list %}
 
-<div class="grid">
-
-<div class="card">
-<div>Toplam Puan</div>
-<div class="stat">{{ toplam_puan }}</div>
-</div>
-
-<div class="card">
-<div>Gruplarım</div>
-<div class="stat">{{ gruplar|length }}</div>
-</div>
-
-<div class="card">
-<div>Yaklaşan Maç</div>
-<div class="stat">{{ yaklasan_maclar|length }}</div>
-</div>
-
-<div class="card">
-<div>Toplam Tahmin</div>
-<div class="stat">{{ toplam_tahmin }}</div>
-</div>
-
-</div>
-
-
-<div class="card">
-<h2>Gruplarım</h2>
-
-{% if gruplar %}
-  {% for grup in gruplar %}
-    <p>
-      <a class="btn" href="{{ url_for('grup', grup_id=grup.id) }}">
-        {{ grup.ad }}
-      </a>
+<div class="sayfa-bas">
+  <div>
+    <h1>Selam, {{ current_user.kullanici_adi }}</h1>
+    <p class="alt">
+      {% if bekleyen %}{{ bekleyen|length }} maç tahminini bekliyor.{% else %}Yaklaşan maçların hepsine tahmin girdin.{% endif %}
     </p>
-  {% endfor %}
-{% else %}
-  <p>Henüz bir grubunuz yok.</p>
-  <a class="btn" href="{{ url_for('gruplar') }}">Grup oluştur</a>
-{% endif %}
+  </div>
 </div>
 
+<div class="serit">
+  <div><div class="deger">{{ toplam_puan }}</div><div class="ad">Toplam puan</div></div>
+  <div><div class="deger">{{ toplam_tahmin }}</div><div class="ad">Tahmin</div></div>
+  <div><div class="deger">{{ gruplar|length }}</div><div class="ad">Grup</div></div>
+  <div><div class="deger">{{ yaklasan_maclar|length }}</div><div class="ad">Yaklaşan maç</div></div>
+</div>
 
-<div class="card">
-<h2>⚽ Yaklaşan Maçlar</h2>
-
-{% if yaklasan_maclar %}
-  {% for mac in yaklasan_maclar %}
-    <div class="match">
-      <div class="teams">
-        <span>
-          {% set ev_fallback = takim_logo_url(mac.ev_sahibi) %}
-          {% set ev_src = mac.ev_logo or ev_fallback %}
-          {% if ev_src %}
-            <img class="logo" src="{{ ev_src }}"{% if ev_fallback and ev_fallback != ev_src %} onerror="this.onerror=null;this.src='{{ ev_fallback }}';"{% endif %}>
-          {% endif %}
-          {{ mac.ev_sahibi }}
-        </span>
-
-        <span>VS</span>
-
-        <span>
-          {{ mac.deplasman }}
-          {% set dep_fallback = takim_logo_url(mac.deplasman) %}
-          {% set dep_src = mac.deplasman_logo or dep_fallback %}
-          {% if dep_src %}
-            <img class="logo" src="{{ dep_src }}"{% if dep_fallback and dep_fallback != dep_src %} onerror="this.onerror=null;this.src='{{ dep_fallback }}';"{% endif %}>
-          {% endif %}
-        </span>
-      </div>
-
-      <p>
-        🕒 
-        {% if mac.baslangic %}
-          {{ mac.baslangic | tr_saat }}
-        {% endif %}
-        - {{ mac.lig }}
-      </p>
-
-      <!-- Kullanıcının Bu Maç İçin Tahmini -->
-      {% set t = tahminler.get(mac.id) %}
-      <div class="match-info">
-        {% if t %}
-          🎯 Tahmininiz: <strong>{{ t.ev_skor }} - {{ t.deplasman_skor }}</strong>
-        {% else %}
-          <span class="badge badge-warn">⚠️ Henüz tahmin yapmadınız</span>
-        {% endif %}
-      </div>
-
+<section class="panel">
+  <div class="panel-bas">
+    <h2>Gruplarım</h2>
+    <a class="kucuk" href="{{ url_for('gruplar') }}">Tümü</a>
+  </div>
+  {% if gruplar %}
+    <ul class="grup-listesi">
+      {% for grup in gruplar %}
+      <li><a href="{{ url_for('grup', grup_id=grup.id) }}"><span>{{ grup.ad }}</span><span class="sessiz" aria-hidden="true">›</span></a></li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="bos">
+      <strong>Henüz bir grupta değilsin.</strong>
+      Bir grup kur ya da arkadaşının davet koduyla katıl.
+      <div style="margin-top:12px"><a class="btn" href="{{ url_for('gruplar') }}">Grup kur veya katıl</a></div>
     </div>
-  {% endfor %}
-{% else %}
-  <p>Şu anda yaklaşan maç bulunamadı.</p>
-{% endif %}
+  {% endif %}
+</section>
 
-</div>
-
-
-<!-- Biten Maçlar ve Sonuçları -->
-<div class="card">
-<h2>🏁 Son Oynanan Maçlar ve Sonuçlar</h2>
-
-{% if biten_maclar %}
-  {% for mac in biten_maclar %}
-    <div class="match">
-      <div class="teams">
-        <span>
-          {% set ev_fallback = takim_logo_url(mac.ev_sahibi) %}
-          {% set ev_src = mac.ev_logo or ev_fallback %}
-          {% if ev_src %}
-            <img class="logo" src="{{ ev_src }}"{% if ev_fallback and ev_fallback != ev_src %} onerror="this.onerror=null;this.src='{{ ev_fallback }}';"{% endif %}>
-          {% endif %}
-          {{ mac.ev_sahibi }}
-        </span>
-
-        <span class="score-pill">
-          {{ mac.ev_skor }} - {{ mac.deplasman_skor }}
-        </span>
-
-        <span>
-          {{ mac.deplasman }}
-          {% set dep_fallback = takim_logo_url(mac.deplasman) %}
-          {% set dep_src = mac.deplasman_logo or dep_fallback %}
-          {% if dep_src %}
-            <img class="logo" src="{{ dep_src }}"{% if dep_fallback and dep_fallback != dep_src %} onerror="this.onerror=null;this.src='{{ dep_fallback }}';"{% endif %}>
-          {% endif %}
-        </span>
+<section class="panel">
+  <div class="panel-bas"><h2>Yaklaşan maçlar</h2></div>
+  {% if yaklasan_maclar %}
+    {% for mac in yaklasan_maclar[:6] %}
+    {% set t = tahminler.get(mac.id) %}
+    <article class="mac">
+      <div class="mac-ust">
+        <span>{% if mac.baslangic %}{{ mac.baslangic | tr_saat("%d.%m %H:%M") }}{% endif %}, {{ mac.lig }}</span>
+        {% if t %}<span class="etiket etiket-tam">Tahminin {{ t.ev_skor }}–{{ t.deplasman_skor }}</span>{% else %}<span class="etiket etiket-uyari">Tahmin bekliyor</span>{% endif %}
       </div>
+      {{ p.fikstur(mac) }}
+    </article>
+    {% endfor %}
+    {% if gruplar and bekleyen %}
+      <a class="btn btn-blok" style="margin-top:12px" href="{{ url_for('grup', grup_id=gruplar[0].id) }}">Tahmin gir</a>
+    {% endif %}
+  {% else %}
+    <div class="bos"><strong>Şu an yaklaşan maç yok.</strong>Yeni fikstür gelince burada görünecek.</div>
+  {% endif %}
+</section>
 
-      <p style="font-size: 0.85em; color: var(--muted);">{{ mac.lig }}</p>
-
-      <!-- Biten Maç İçin Kullanıcının Tahmini ve Kazanılan Puan -->
-      {% set t = tahminler.get(mac.id) %}
-      <div class="match-info">
-        {% if t %}
-          🎯 Tahmininiz: {{ t.ev_skor }} - {{ t.deplasman_skor }}
-          {% if t.puan == 5 %}
-            <span class="badge badge-win">🎯 Tam İsabet · +5</span>
-          {% elif t.puan == 3 %}
-            <span class="badge badge-draw">✅ Sonuç Tuttu · +3</span>
-          {% else %}
-            <span class="badge badge-zero">+0</span>
-          {% endif %}
-        {% else %}
-          Maç için tahmininiz bulunmuyor.
-        {% endif %}
+<section class="panel">
+  <div class="panel-bas"><h2>Son sonuçlar</h2><a class="kucuk" href="{{ url_for('puan_durumu') }}">Puan durumu</a></div>
+  {% if biten_maclar %}
+    {% for mac in biten_maclar %}
+    {% set t = tahminler.get(mac.id) %}
+    <article class="mac">
+      <div class="mac-ust">
+        <span>{{ mac.lig }}</span>
+        {% if t %}{{ p.puan_etiketi(t.puan) }}{% endif %}
       </div>
+      {{ p.fikstur(mac) }}
+      <p class="mac-alt">{% if t %}Tahminin <strong>{{ t.ev_skor }}–{{ t.deplasman_skor }}</strong>{% else %}Bu maça tahmin girmedin.{% endif %}</p>
+    </article>
+    {% endfor %}
+  {% else %}
+    <div class="bos"><strong>Henüz biten maç yok.</strong>İlk sonuçlar gelince puanların burada görünecek.</div>
+  {% endif %}
+</section>
 
-    </div>
-  {% endfor %}
-{% else %}
-  <p>Henüz sonuçlanmış maç bulunmuyor.</p>
-{% endif %}
-
-</div>
+<style>
+.grup-listesi{list-style:none; margin:0; padding:0}
+.grup-listesi li{border-top:1px solid var(--cizgi)}
+.grup-listesi li:first-child{border-top:0}
+.grup-listesi a{display:flex; justify-content:space-between; align-items:center; padding:12px 2px; color:var(--murekkep); text-decoration:none; font-weight:600; font-size:17px}
+.grup-listesi a:hover{color:var(--cim)}
+</style>
 
 {% endblock %}

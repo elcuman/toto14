@@ -58,8 +58,11 @@ if database_url.startswith("postgres://"):
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,  # Render Postgres boşta kalan bağlantıyı kapatabilir; bu ayar hatayı önler
+    "pool_pre_ping": True,  # boşta kalan bağlantı kapanmışsa hatayı önler
     "pool_recycle": 280,
+    # Supabase ücretsiz planda eşzamanlı bağlantı sınırlı: 2 worker x (4+2) = en fazla 12 bağlantı
+    "pool_size": 4,
+    "max_overflow": 2,
 }
 
 db = SQLAlchemy(app)
@@ -130,11 +133,27 @@ NATIONS_LEAGUE_ID = 2037
 # satır eklemek yeterli; sync_all_leagues() otomatik olarak hepsini çeker.
 LEAGUES = {
     CHAMPIONS_LEAGUE_CODE: {"id": CHAMPIONS_LEAGUE_ID, "ad": "UEFA Champions League", "provider": "football-data"},
-    SUPER_LIG_CODE: {"id": SUPER_LIG_ID, "ad": "Süper Lig", "provider": "sportapi7"},
+    SUPER_LIG_CODE: {"id": SUPER_LIG_ID, "ad": "Süper Lig", "provider": "espn"},  # ücretsiz, kota yok
     NATIONS_LEAGUE_CODE: {"id": NATIONS_LEAGUE_ID, "ad": "UEFA Uluslar Ligi", "provider": "espn-nations"},
 }
 
 TAKIP_EDILEN_LIG_ID_LISTESI = [lig["id"] for lig in LEAGUES.values()]
+
+# Grup sayfasındaki lig sekmelerinde görünen kısa adlar.
+LIG_KISA_ADLARI = {
+    CHAMPIONS_LEAGUE_ID: "Şampiyonlar Ligi",
+    SUPER_LIG_ID: "Süper Lig",
+    NATIONS_LEAGUE_ID: "Uluslar Ligi",
+}
+
+# Grup sayfasında "bu hafta" sayılan süre: bir ligin sıradaki maçı bu kadar
+# gün içinde değilse o lig için maç listelenmez.
+HAFTA_PENCERESI_GUN = 7
+
+# Sohbet odası ayarları
+MESAJ_MAX_UZUNLUK = 500
+SOHBET_SAYFA_BOYU = 50       # sayfa açılınca gösterilen son mesaj sayısı
+SOHBET_MIN_ARALIK_SN = 1     # aynı kullanıcının iki mesajı arasındaki en kısa süre
 
 # Şampiyonlar Ligi grup/lig aşaması Kasım 2026'ya kadar oynanmayacak
 # (takvimde sadece birkaç maç var). Bu yüzden o tarihe kadar Şampiyonlar
@@ -157,6 +176,8 @@ def gosterilecek_lig_id_listesi():
 
 
 API_TIMEOUT = 30
+# Logo çekerken dış servisi en fazla bu kadar bekle (sayfaları tıkamasın)
+LOGO_TIMEOUT = 5
 
 
 # ============================================================
@@ -687,6 +708,91 @@ def load_user(user_id):
 # HELPERS
 # ============================================================
 
+class SenkronKaydi(db.Model):
+    """Otomatik senkronun en son ne zaman (hangi türde) çalıştığını tutar."""
+    __tablename__ = "senkron_kayitlari"
+
+    ad = db.Column(db.String(40), primary_key=True)
+    zaman = db.Column(db.DateTime, nullable=False)
+
+
+class Mesaj(db.Model):
+    """Grup sohbet odasındaki tek bir mesaj."""
+    __tablename__ = "mesajlar"
+
+    id = db.Column(db.Integer, primary_key=True)
+    grup_id = db.Column(db.Integer, db.ForeignKey("gruplar.id", ondelete="CASCADE"), nullable=False, index=True)
+    kullanici_id = db.Column(db.Integer, db.ForeignKey("kullanicilar.id", ondelete="CASCADE"), nullable=False)
+    icerik = db.Column(db.String(MESAJ_MAX_UZUNLUK), nullable=False)
+    olusturulma = db.Column(db.DateTime, default=lambda: datetime.utcnow(), nullable=False)
+    # Yanıtlanan mesaj (yoksa None). Eski tablolara initialize_database() ekler.
+    yanit_id = db.Column(db.Integer, nullable=True)
+
+    kullanici = db.relationship("Kullanici")
+    yanitlanan = db.relationship(
+        "Mesaj", primaryjoin="Mesaj.yanit_id == Mesaj.id", foreign_keys="Mesaj.yanit_id",
+        remote_side="Mesaj.id", uselist=False, viewonly=True, lazy="select",
+    )
+
+    def to_dict(self):
+        veri = {
+            "id": self.id,
+            "kullanici_id": self.kullanici_id,
+            "kullanici_adi": self.kullanici.kullanici_adi if self.kullanici else "?",
+            "icerik": self.icerik,
+            "saat": tr_saat_filter(self.olusturulma, "%d.%m %H:%M"),
+            "yanit": None,
+        }
+        if self.yanit_id:
+            y = self.yanitlanan
+            veri["yanit"] = ({"id": y.id, "kullanici_adi": y.kullanici.kullanici_adi if y.kullanici else "?",
+                              "icerik": y.icerik[:120]} if y else
+                             {"id": self.yanit_id, "kullanici_adi": "", "icerik": "Bu mesaj silindi."})
+        return veri
+
+
+class SohbetOkuma(db.Model):
+    """Kullanıcının bir grubun sohbetinde en son gördüğü mesaj (okunmamış sayacı için)."""
+    __tablename__ = "sohbet_okumalari"
+
+    grup_id = db.Column(db.Integer, db.ForeignKey("gruplar.id", ondelete="CASCADE"), primary_key=True)
+    kullanici_id = db.Column(db.Integer, db.ForeignKey("kullanicilar.id", ondelete="CASCADE"), primary_key=True)
+    son_okunan_id = db.Column(db.Integer, nullable=False, default=0)
+
+
+def sohbet_okundu_isaretle(grup_id, kullanici_id, mesaj_id):
+    if not mesaj_id:
+        return
+    kayit = db.session.get(SohbetOkuma, (grup_id, kullanici_id))
+    if kayit is None:
+        db.session.add(SohbetOkuma(grup_id=grup_id, kullanici_id=kullanici_id, son_okunan_id=mesaj_id))
+    elif mesaj_id > kayit.son_okunan_id:
+        kayit.son_okunan_id = mesaj_id
+    db.session.commit()
+
+
+def okunmamis_mesaj_sayisi(grup_id, kullanici_id):
+    kayit = db.session.get(SohbetOkuma, (grup_id, kullanici_id))
+    son = kayit.son_okunan_id if kayit else 0
+    return Mesaj.query.filter(Mesaj.grup_id == grup_id, Mesaj.id > son,
+                              Mesaj.kullanici_id != kullanici_id).count()
+
+
+def gruplara_gore_okunmamis(kullanici_id):
+    """{grup_id: okunmamış mesaj sayısı} — kullanıcının tüm grupları için TEK sorgu."""
+    satirlar = db.session.execute(db.text("""
+        SELECT gu.grup_id, COUNT(m.id)
+        FROM grup_uyelikleri gu
+        LEFT JOIN sohbet_okumalari so ON so.grup_id = gu.grup_id AND so.kullanici_id = gu.kullanici_id
+        LEFT JOIN mesajlar m ON m.grup_id = gu.grup_id
+             AND m.id > COALESCE(so.son_okunan_id, 0)
+             AND m.kullanici_id <> gu.kullanici_id
+        WHERE gu.kullanici_id = :uid
+        GROUP BY gu.grup_id
+    """), {"uid": kullanici_id}).all()
+    return {gid: int(n) for gid, n in satirlar}
+
+
 def utc_now_naive():
     return datetime.now(
         timezone.utc
@@ -813,7 +919,7 @@ def football_match_to_db(match, competition_id=None, active_season=None):
     return mac
 
 
-def sync_league(competition_code, requested_season=None):
+def sync_league(competition_code, requested_season=None, aylar=None):
     """
     Verilen lig kodu için doğru sağlayıcıyı seçip senkronizasyonu yapar.
     LEAGUES sözlüğündeki "provider" alanına göre football-data.org, ESPN
@@ -827,10 +933,10 @@ def sync_league(competition_code, requested_season=None):
         return sync_super_lig_sportapi7(requested_season=requested_season)
 
     if provider == "espn":
-        return sync_super_lig_espn(requested_season=requested_season)
+        return sync_super_lig_espn(requested_season=requested_season, aylar=aylar)
 
     if provider == "espn-nations":
-        return sync_nations_league_espn(requested_season=requested_season)
+        return sync_nations_league_espn(requested_season=requested_season, aylar=aylar)
 
     if provider == "api-football":
         return sync_super_lig_api_football(requested_season=requested_season)
@@ -1210,54 +1316,171 @@ def espn_event_to_db(event, hafta_no, season_year, lig_adi="Süper Lig", lig_id=
     return mac
 
 
-def sync_super_lig_espn(requested_season=None):
+_TR_HARF = str.maketrans("çğıöşüâîûÇĞİÖŞÜÂÎÛ", "cgiosuaiucgiosuaiu")
+_TAKIM_GEREKSIZ_KELIMELER = {"fk", "jk", "sk", "as", "a.s.", "kulubu", "spor", "istanbul",
+                             "sportif", "faaliyetler", "club", "fc", "1965"}
+
+
+def takim_adi_normalize(ad):
+    """'Beşiktaş JK', 'Besiktas', 'Başakşehir FK', 'Istanbul Basaksehir' gibi
+    farklı yazımları karşılaştırılabilir hale getirir."""
+    ad = (ad or "").translate(_TR_HARF).lower().replace("-", " ").replace(".", " ")
+    kelimeler = [k for k in ad.split() if k and k not in _TAKIM_GEREKSIZ_KELIMELER]
+    return " ".join(kelimeler) or ad.strip()
+
+
+def takimlar_ayni_mi(a, b):
+    na, nb = takim_adi_normalize(a), takim_adi_normalize(b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    return na.split()[0] == nb.split()[0] and len(na.split()[0]) >= 4
+
+
+def _espn_takim(event, taraf):
+    competitions = event.get("competitions") or []
+    competition = competitions[0] if competitions else {}
+    for c in competition.get("competitors") or []:
+        if c.get("homeAway") == taraf:
+            return c
+    return {}
+
+
+def sync_super_lig_espn(requested_season=None, aylar=None):
     """
-    Süper Lig maçlarını ESPN'in ücretsiz, key gerektirmeyen uç noktasından
-    çekip veritabanına yazar. Sezon Ağustos-Mayıs arası kabul edilip tüm
-    sezon tek istekte (geniş tarih aralığıyla) çekilir.
+    Süper Lig maçlarını ESPN'in ücretsiz, anahtar gerektirmeyen uç noktasından
+    çeker (kota yok). Gelen her maçı ÖNCE veritabanındaki mevcut maçla
+    (başlama saati + takım adları) eşleştirir; böylece başka bir sağlayıcıdan
+    (SportAPI7 vb.) gelmiş maçlar ÇİFT kayıt olmaz ve üzerlerindeki tahminler
+    kaybolmaz. Eşleşen maçta takım adları ve hafta numarası korunur; skor,
+    durum, saat ve logo ESPN'den güncellenir.
+    Admin panelinden ELLE girilmiş sonuçlara (api_status == 'MANUEL') dokunulmaz.
     """
     simdi = datetime.now(timezone.utc)
     if requested_season:
         sezon_baslangic_yili = requested_season
     else:
-        # Temmuz ayından önceyse hâlâ bir önceki yılın sezonundayızdır
-        # (örn. Ocak 2027 -> 2026-2027 sezonu, sezon başlangıç yılı 2026).
         sezon_baslangic_yili = simdi.year if simdi.month >= 7 else simdi.year - 1
 
-    tarih_baslangic = f"{sezon_baslangic_yili}0701"
-    tarih_bitis = f"{sezon_baslangic_yili + 1}0630"
-
-    response = espn_get(
-        ESPN_SUPER_LIG_SLUG,
-        "scoreboard",
-        params={"dates": f"{tarih_baslangic}-{tarih_bitis}", "limit": 1000},
-    )
-    events = response.get("events", [])
+    # ESPN "dates=BASLANGIC-BITIS" aralık formunu 400 ile reddediyor; AY (YYYYMM)
+    # formu çalışıyor. Sezonu ay ay (Temmuz-Haziran, 12 istek) çekip event
+    # id'ye göre tekilleştiriyoruz. Tek bir ay hata verirse diğerleri devam eder.
+    if not aylar:  # belirli aylar verilmediyse tüm sezon
+        aylar = [(sezon_baslangic_yili, a) for a in range(7, 13)] + [
+            (sezon_baslangic_yili + 1, a) for a in range(1, 7)
+        ]
+    eventler_by_id = {}
+    hatalar = []
+    basarili_istek = 0
+    for yil, ay in aylar:
+        try:
+            yanit = espn_get(ESPN_SUPER_LIG_SLUG, "scoreboard",
+                             params={"dates": f"{yil}{ay:02d}", "limit": 500})
+            basarili_istek += 1
+        except Exception as e:
+            hatalar.append(f"{yil}-{ay:02d}: {e}")
+            continue
+        for e in yanit.get("events", []) or []:
+            if e.get("id"):
+                eventler_by_id[e["id"]] = e
+    if basarili_istek == 0:
+        raise RuntimeError("ESPN Süper Lig istekleri başarısız: " + " | ".join(hatalar[:2]))
+    events = list(eventler_by_id.values())
     event_hafta_ciftleri = espn_events_to_maclar(events)
 
-    inserted = 0
-    updated = 0
-    skipped = 0
+    mevcut_maclar = Mac.query.filter(Mac.lig_id == SUPER_LIG_ID).all()
+    kullanilan_idler = set()
 
-    for event, hafta_no in event_hafta_ciftleri:
-        raw_external_id = event.get("id")
-        if not raw_external_id:
-            skipped += 1
+    # ESPN adı -> sitede kullanılan Türkçe ad (ör. 'Besiktas' -> 'Beşiktaş JK')
+    bilinen_adlar = {}
+    for m in mevcut_maclar:
+        for ad in (m.ev_sahibi, m.deplasman):
+            if ad:
+                bilinen_adlar.setdefault(takim_adi_normalize(ad), ad)
+
+    def turkce_ad(espn_adi):
+        n = takim_adi_normalize(espn_adi)
+        if n in bilinen_adlar:
+            return bilinen_adlar[n]
+        for norm, ad in bilinen_adlar.items():
+            if takimlar_ayni_mi(espn_adi, ad):
+                return ad
+        return espn_adi
+
+    def eslesen_mac(event, ev_adi, dep_adi, tarih):
+        external_id = ESPN_EXTERNAL_ID_OFFSET + int(event["id"])
+        for m in mevcut_maclar:
+            if m.external_id == external_id:
+                return m
+        for m in mevcut_maclar:
+            if m.id in kullanilan_idler or not m.baslangic or tarih is None:
+                continue
+            if abs((m.baslangic - tarih).total_seconds()) > 3 * 24 * 3600:
+                continue
+            if takimlar_ayni_mi(m.ev_sahibi, ev_adi) and takimlar_ayni_mi(m.deplasman, dep_adi):
+                return m
+        return None
+
+    # 1. tur: eşleştir ve ESPN hafta no ile sitedeki hafta no arasındaki farkı bul
+    eslesmeler = []
+    farklar = {}
+    for event, espn_hafta in event_hafta_ciftleri:
+        if not event.get("id"):
             continue
+        ev = (_espn_takim(event, "home").get("team") or {}).get("displayName") or ""
+        dep = (_espn_takim(event, "away").get("team") or {}).get("displayName") or ""
+        tarih = parse_api_date(event.get("date"))
+        mac = eslesen_mac(event, ev, dep, tarih)
+        if mac is not None:
+            kullanilan_idler.add(mac.id)
+            if mac.hafta and str(mac.hafta).isdigit():
+                fark = int(mac.hafta) - espn_hafta
+                farklar[fark] = farklar.get(fark, 0) + 1
+        eslesmeler.append((event, espn_hafta, ev, dep, tarih, mac))
+    hafta_farki = max(farklar, key=farklar.get) if farklar else 0
 
-        existing = Mac.query.filter_by(
-            external_id=ESPN_EXTERNAL_ID_OFFSET + int(raw_external_id)
-        ).first()
-
-        result = espn_event_to_db(event, hafta_no, sezon_baslangic_yili)
-        if not result:
-            skipped += 1
-            continue
-
-        if existing:
-            updated += 1
-        else:
+    # 2. tur: yaz
+    inserted = updated = skipped = manuel_korunan = 0
+    for event, espn_hafta, ev, dep, tarih, mac in eslesmeler:
+        ev_c, dep_c = _espn_takim(event, "home"), _espn_takim(event, "away")
+        status_type = ((event.get("status") or {}).get("type")) or {}
+        yeni = mac is None
+        if yeni:
+            mac = Mac(external_id=ESPN_EXTERNAL_ID_OFFSET + int(event["id"]))
+            db.session.add(mac)
+            mac.ev_sahibi = turkce_ad(ev) or "Bilinmeyen Takım"
+            mac.deplasman = turkce_ad(dep) or "Bilinmeyen Takım"
+            mac.lig = "Süper Lig"
+            mac.lig_id = SUPER_LIG_ID
+            mac.hafta = str(espn_hafta + hafta_farki)
             inserted += 1
+        else:
+            mac.external_id = ESPN_EXTERNAL_ID_OFFSET + int(event["id"])
+            updated += 1
+
+        mac.sezon = sezon_baslangic_yili
+        mac.ev_logo = (ev_c.get("team") or {}).get("logo") or mac.ev_logo
+        mac.deplasman_logo = (dep_c.get("team") or {}).get("logo") or mac.deplasman_logo
+        if tarih is not None:
+            mac.baslangic = tarih
+        elle_saat_uygula(mac)
+
+        if mac.api_status == "MANUEL":
+            manuel_korunan += 1          # elle girilen sonuç her zaman geçerli
+        else:
+            yeni_durum = map_espn_status(status_type)
+            if not (mac.durum == "bitti" and yeni_durum != "bitti" and not yeni):
+                mac.durum = yeni_durum
+            mac.api_status = status_type.get("name")
+            for alan, c in (("ev_skor", ev_c), ("deplasman_skor", dep_c)):
+                skor = c.get("score")
+                if skor not in (None, "") and mac.durum in ("bitti", "oynaniyor"):
+                    try:
+                        setattr(mac, alan, int(skor))
+                    except (TypeError, ValueError):
+                        pass
+        mac.son_guncelleme = utc_now_naive()
 
     db.session.commit()
     recalculate_all_points()
@@ -1269,7 +1492,9 @@ def sync_super_lig_espn(requested_season=None):
         "api_matches": len(events),
         "inserted": inserted,
         "updated": updated,
-        "skipped": skipped
+        "skipped": skipped,
+        "manuel_korunan": manuel_korunan,
+        "hafta_farki": hafta_farki,
     }
 
 
@@ -1288,7 +1513,7 @@ def espn_turkiye_maci_mi(event):
     return False
 
 
-def sync_nations_league_espn(requested_season=None):
+def sync_nations_league_espn(requested_season=None, aylar=None):
     """
     UEFA Uluslar Ligi'nde SADECE Türkiye'nin maçlarını ESPN'in ücretsiz, key
     gerektirmeyen uç noktasından (slug: uefa.nations) çekip veritabanına yazar.
@@ -1307,9 +1532,10 @@ def sync_nations_league_espn(requested_season=None):
     # yüzden sezonu ay ay (Ağustos-Temmuz, 12 istek) çekip event id'ye göre
     # tekilleştiriyoruz. Tek bir ay hata verirse diğerleri devam eder; hepsi
     # hata verirse hata fırlatılır.
-    aylar = [(sezon_baslangic_yili, m) for m in range(8, 13)] + [
-        (sezon_baslangic_yili + 1, m) for m in range(1, 8)
-    ]
+    if not aylar:  # belirli aylar verilmediyse tüm sezon
+        aylar = [(sezon_baslangic_yili, m) for m in range(8, 13)] + [
+            (sezon_baslangic_yili + 1, m) for m in range(1, 8)
+        ]
     eventler_by_id = {}
     hatalar = []
     basarili_istek = 0
@@ -1598,6 +1824,22 @@ def recalculate_all_points():
 def initialize_database():
     with app.app_context():
         db.create_all()
+        # Sonradan eklenen kolonlar (create_all var olan tabloya kolon eklemez)
+        try:
+            kolonlar = {k["name"] for k in db.inspect(db.engine).get_columns("mesajlar")}
+            if "yanit_id" not in kolonlar:
+                db.session.execute(db.text("ALTER TABLE mesajlar ADD COLUMN yanit_id INTEGER"))
+                db.session.commit()
+        except Exception:
+            db.session.rollback()
+        if db.engine.dialect.name == "postgresql":
+            try:
+                db.session.execute(db.text("ALTER TABLE mesajlar ENABLE ROW LEVEL SECURITY"))
+                db.session.execute(db.text("ALTER TABLE sohbet_okumalari ENABLE ROW LEVEL SECURITY"))
+                db.session.execute(db.text("ALTER TABLE senkron_kayitlari ENABLE ROW LEVEL SECURITY"))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
         admin_username = os.getenv("ADMIN_USERNAME", "admin")
         admin_password = os.getenv("ADMIN_PASSWORD", "Admin123!")
 
@@ -1824,7 +2066,7 @@ def haftalik_liderlik_hesapla(grup_id):
         veri = haftalar.setdefault(anahtar, {"puanlar": {}})
         veri["puanlar"][kullanici_id] = veri["puanlar"].get(kullanici_id, 0) + (puan or 0)
 
-    kullanici_map = {u.kullanici_id: u.kullanici for u in GrupUyeligi.query.filter_by(grup_id=grup_id).all()}
+    kullanici_map = {u.kullanici_id: u.kullanici for u in GrupUyeligi.query.options(db.joinedload(GrupUyeligi.kullanici)).filter_by(grup_id=grup_id).all()}
 
     sonuc = []
     for hafta_basi, veri in haftalar.items():
@@ -1856,7 +2098,8 @@ def su_anki_hafta_liderligi_hesapla(grup_id, hafta_basi, hafta_sonu):
     olsa bile) 0 puanla dahil eder ki yeni hafta başladığında herkes gerçekten
     0'dan başlasın.
     """
-    members = GrupUyeligi.query.filter_by(grup_id=grup_id).all()
+    members = (GrupUyeligi.query.options(db.joinedload(GrupUyeligi.kullanici))
+               .filter_by(grup_id=grup_id).all())
     kullanici_map = {u.kullanici_id: u.kullanici for u in members}
     puanlar = {uid: 0 for uid in kullanici_map}
 
@@ -1894,26 +2137,57 @@ def grup(grup_id):
     # Takip edilen her lig için bir sonraki maçı bulup o ligin "aktif haftası"nı
     # belirliyoruz; birden fazla lig aynı anda gösterilebiliyor (örn. Şampiyonlar
     # Ligi + Süper Lig).
+    # SADECE BU HAFTANIN maçları: bir ligin sıradaki maçı önümüzdeki
+    # HAFTA_PENCERESI_GUN gün içinde değilse o lig bu hafta boş gösterilir
+    # (örn. Uluslar Ligi'nin bir sonraki maçı 1 ay sonraysa listelenmez).
+    pencere_sonu = now + timedelta(days=HAFTA_PENCERESI_GUN)
     aktif_haftalar = {}
+    sonraki_mac_tarihleri = {}
     for lig_id in gosterilecek_lig_id_listesi():
         en_yakin_mac = Mac.query.filter(
             Mac.lig_id == lig_id, Mac.baslangic.isnot(None), Mac.baslangic >= now,
             super_lig_takim_filtresi(),
         ).order_by(Mac.baslangic.asc()).first()
-        if en_yakin_mac and en_yakin_mac.hafta:
+        if not en_yakin_mac:
+            continue
+        if en_yakin_mac.hafta and en_yakin_mac.baslangic <= pencere_sonu:
             aktif_haftalar[lig_id] = en_yakin_mac.hafta
+        else:
+            sonraki_mac_tarihleri[lig_id] = en_yakin_mac.baslangic
 
+    maclar = []
     if aktif_haftalar:
         kosullar = [db.and_(Mac.lig_id == lig_id, Mac.hafta == hafta) for lig_id, hafta in aktif_haftalar.items()]
         maclar = Mac.query.filter(
             Mac.lig_id.in_(gosterilecek_lig_id_listesi()), db.or_(*kosullar),
+            Mac.baslangic <= pencere_sonu,
             super_lig_takim_filtresi(),
         ).order_by(Mac.baslangic.asc()).all()
+
+    # Lig sekmeleri: grup sayfasının üstünde her lig için ayrı bir buton.
+    lig_sekmeleri = []
+    for kod, bilgi in LEAGUES.items():
+        if bilgi["id"] not in gosterilecek_lig_id_listesi():
+            continue
+        lig_maclari = [m for m in maclar if m.lig_id == bilgi["id"]]
+        lig_sekmeleri.append({
+            "id": bilgi["id"],
+            "kod": kod,
+            "ad": LIG_KISA_ADLARI.get(bilgi["id"], bilgi["ad"]),
+            "maclar": lig_maclari,
+            "hafta": aktif_haftalar.get(bilgi["id"]),
+            "sonraki_mac": sonraki_mac_tarihleri.get(bilgi["id"]),
+            "acik_mac": sum(1 for m in lig_maclari if m.oynanabilir_mi()),
+        })
+    # Varsayılan açık sekme: tahmine açık maçı en yakın olan lig.
+    def _ilk_acik_mac(sekme):
+        acik = [m.baslangic for m in sekme["maclar"] if m.oynanabilir_mi() and m.baslangic]
+        return min(acik) if acik else datetime.max
+    dolu_sekmeler = [s for s in lig_sekmeleri if s["maclar"]]
+    if dolu_sekmeler:
+        varsayilan_sekme = min(dolu_sekmeler, key=_ilk_acik_mac)["kod"]
     else:
-        maclar = Mac.query.filter(
-            Mac.lig_id.in_(gosterilecek_lig_id_listesi()),
-            super_lig_takim_filtresi(),
-        ).order_by(Mac.baslangic.desc()).limit(10).all()
+        varsayilan_sekme = lig_sekmeleri[0]["kod"] if lig_sekmeleri else None
 
     # Geriye dönük uyumluluk: şablon tek bir "aktif_hafta" bekliyorsa
     # (örn. Şampiyonlar Ligi'ninkini) onu da gönderiyoruz.
@@ -1928,16 +2202,24 @@ def grup(grup_id):
         for lig_id, hafta in aktif_haftalar.items()
     ]
 
-    tahmin_dict = {t.mac_id: t for t in Tahmin.query.filter_by(grup_id=grup_id, kullanici_id=current_user.id).all()}
-    members = GrupUyeligi.query.filter_by(grup_id=grup_id).all()
+    # Üyeler kullanıcı bilgileriyle TEK sorguda (her üye için ayrı sorgu atılmasın)
+    members = (GrupUyeligi.query.options(db.joinedload(GrupUyeligi.kullanici))
+               .filter_by(grup_id=grup_id).all())
 
+    # Grubun tüm tahminleri TEK sorguda; hem kendi tahminlerim hem matris hem
+    # sezon toplamları buradan hesaplanır.
     grup_tahmin_matrisi = {}
+    tahmin_dict = {}
+    toplam_puanlar = {}
     for t in Tahmin.query.filter_by(grup_id=grup_id).all():
         grup_tahmin_matrisi.setdefault(t.mac_id, {})[t.kullanici_id] = t
+        toplam_puanlar[t.kullanici_id] = toplam_puanlar.get(t.kullanici_id, 0) + (t.puan or 0)
+        if t.kullanici_id == current_user.id:
+            tahmin_dict[t.mac_id] = t
 
     # Sezonluk / tüm zamanlar genel sıralama (kümülatif toplam puan)
     leaderboard = sorted([
-        {"user": m.kullanici, "points": int(db.session.query(db.func.coalesce(db.func.sum(Tahmin.puan), 0)).filter(Tahmin.grup_id == grup_id, Tahmin.kullanici_id == m.kullanici_id).scalar() or 0)}
+        {"user": m.kullanici, "points": int(toplam_puanlar.get(m.kullanici_id, 0))}
         for m in members
     ], key=lambda x: x["points"], reverse=True)
 
@@ -1955,6 +2237,9 @@ def grup(grup_id):
         "grup.html",
         grup=grup_obj,
         maclar=maclar,
+        lig_sekmeleri=lig_sekmeleri,
+        mesaj_sayisi=okunmamis_mesaj_sayisi(grup_id, current_user.id),
+        varsayilan_sekme=varsayilan_sekme,
         aktif_hafta=aktif_hafta,
         aktif_haftalar_liste=aktif_haftalar_liste,
         tahminler=tahmin_dict,
@@ -1966,6 +2251,104 @@ def grup(grup_id):
         hafta_sonu=hafta_sonu,
         oynanabilir_mac_var=oynanabilir_mac_var
     )
+
+
+def _grup_uyesi_mi(grup_id):
+    return GrupUyeligi.query.filter_by(grup_id=grup_id, kullanici_id=current_user.id).first() is not None
+
+
+@app.route("/grup/<int:grup_id>/sohbet")
+@login_required
+def grup_sohbet(grup_id):
+    grup_obj = db.session.get(Grup, grup_id)
+    if not grup_obj or not _grup_uyesi_mi(grup_id):
+        abort(403)
+    son_mesajlar = (Mesaj.query.filter_by(grup_id=grup_id)
+                    .order_by(Mesaj.id.desc()).limit(SOHBET_SAYFA_BOYU).all())
+    son_mesajlar.reverse()
+    if son_mesajlar:
+        sohbet_okundu_isaretle(grup_id, current_user.id, son_mesajlar[-1].id)
+    uyeler = (GrupUyeligi.query.options(db.joinedload(GrupUyeligi.kullanici))
+              .filter_by(grup_id=grup_id).all())
+    uye_sayisi = len(uyeler)
+    return render_template(
+        "sohbet.html",
+        uyeler=[{"id": u.kullanici_id, "ad": u.kullanici.kullanici_adi} for u in uyeler if u.kullanici],
+        grup=grup_obj,
+        mesajlar=[m.to_dict() for m in son_mesajlar],
+        uye_sayisi=uye_sayisi,
+        max_uzunluk=MESAJ_MAX_UZUNLUK,
+    )
+
+
+@app.route("/grup/<int:grup_id>/sohbet/mesajlar")
+@login_required
+def grup_sohbet_mesajlar(grup_id):
+    """Yeni mesajları getirir (sayfa birkaç saniyede bir bunu çağırır)."""
+    if not _grup_uyesi_mi(grup_id):
+        abort(403)
+    sonra = request.args.get("sonra", type=int, default=0)
+    yeni = (Mesaj.query.filter(Mesaj.grup_id == grup_id, Mesaj.id > sonra)
+            .order_by(Mesaj.id.asc()).limit(100).all())
+    if yeni:
+        sohbet_okundu_isaretle(grup_id, current_user.id, yeni[-1].id)
+    # Silinen mesajları istemcinin de kaldırabilmesi için görünür son id'leri gönder
+    mevcut_idler = [mid for (mid,) in db.session.query(Mesaj.id)
+                    .filter(Mesaj.grup_id == grup_id)
+                    .order_by(Mesaj.id.desc()).limit(SOHBET_SAYFA_BOYU).all()]
+    return jsonify({"mesajlar": [m.to_dict() for m in yeni], "mevcut_idler": mevcut_idler})
+
+
+@app.route("/grup/<int:grup_id>/sohbet/gonder", methods=["POST"])
+@login_required
+def grup_sohbet_gonder(grup_id):
+    if not _grup_uyesi_mi(grup_id):
+        abort(403)
+    veri = request.get_json(silent=True) or {}
+    icerik = (veri.get("icerik") or request.form.get("icerik") or "").strip()
+    if not icerik:
+        return jsonify({"hata": "Boş mesaj gönderilemez."}), 400
+    if len(icerik) > MESAJ_MAX_UZUNLUK:
+        return jsonify({"hata": f"Mesaj en fazla {MESAJ_MAX_UZUNLUK} karakter olabilir."}), 400
+
+    son = (Mesaj.query.filter_by(grup_id=grup_id, kullanici_id=current_user.id)
+           .order_by(Mesaj.id.desc()).first())
+    if son and (datetime.utcnow() - son.olusturulma).total_seconds() < SOHBET_MIN_ARALIK_SN:
+        return jsonify({"hata": "Biraz yavaş 🙂"}), 429
+
+    yanit_id = veri.get("yanit_id")
+    if yanit_id not in (None, ""):
+        try:
+            yanit_id = int(yanit_id)
+        except (TypeError, ValueError):
+            return jsonify({"hata": "Geçersiz yanıt."}), 400
+        hedef = db.session.get(Mesaj, yanit_id)
+        if not hedef or hedef.grup_id != grup_id:
+            return jsonify({"hata": "Yanıtlanan mesaj bulunamadı."}), 400
+    else:
+        yanit_id = None
+
+    mesaj = Mesaj(grup_id=grup_id, kullanici_id=current_user.id, icerik=icerik, yanit_id=yanit_id)
+    db.session.add(mesaj)
+    db.session.commit()
+    sohbet_okundu_isaretle(grup_id, current_user.id, mesaj.id)
+    return jsonify({"mesaj": mesaj.to_dict()})
+
+
+@app.route("/grup/<int:grup_id>/sohbet/sil/<int:mesaj_id>", methods=["POST"])
+@login_required
+def grup_sohbet_sil(grup_id, mesaj_id):
+    mesaj = db.session.get(Mesaj, mesaj_id)
+    if not mesaj or mesaj.grup_id != grup_id:
+        abort(404)
+    grup_obj = db.session.get(Grup, grup_id)
+    yetkili = (mesaj.kullanici_id == current_user.id or current_user.admin
+               or (grup_obj and grup_obj.kurucu_id == current_user.id))
+    if not yetkili:
+        abort(403)
+    db.session.delete(mesaj)
+    db.session.commit()
+    return jsonify({"ok": True})
 
 
 @app.route("/grup/<int:grup_id>/tahminleri-kaydet", methods=["POST"])
@@ -2109,7 +2492,7 @@ def grup_gecmis_maclar(grup_id):
         super_lig_takim_filtresi(),
     ).order_by(Mac.baslangic.desc()).limit(100).all()
 
-    members = GrupUyeligi.query.filter_by(grup_id=grup_id).all()
+    members = GrupUyeligi.query.options(db.joinedload(GrupUyeligi.kullanici)).filter_by(grup_id=grup_id).all()
 
     tahmin_matrisi = {}
     bitmis_mac_idleri = [m.id for m in bitmis_maclar]
@@ -2506,7 +2889,7 @@ STATIC_TEAM_LOGO_ESLESTIRME = {
 
 def _thesportsdb_logo_url(takim_adi):
     try:
-        yanit = requests.get(THESPORTSDB_SEARCH_URL, params={"t": takim_adi}, timeout=API_TIMEOUT)
+        yanit = requests.get(THESPORTSDB_SEARCH_URL, params={"t": takim_adi}, timeout=LOGO_TIMEOUT)
         yanit.raise_for_status()
         takimlar = (yanit.json() or {}).get("teams") or []
         if not takimlar:
@@ -2610,6 +2993,36 @@ def takim_logo_url(takim_adi, mevcut_logo=None):
 app.jinja_env.globals["takim_logo_url"] = takim_logo_url
 
 
+@app.context_processor
+def sohbet_rozeti():
+    """Alt menüdeki Sohbet sekmesinin okunmamış rozeti (sadece girişli kullanıcıda, tek sorgu)."""
+    if not current_user.is_authenticated:
+        return {}
+    try:
+        return {"toplam_okunmamis": sum(gruplara_gore_okunmamis(current_user.id).values())}
+    except Exception:
+        db.session.rollback()
+        return {"toplam_okunmamis": 0}
+
+
+@app.route("/sohbet")
+@login_required
+def sohbetler():
+    """Alt menüdeki Sohbet sekmesi: tek grup varsa direkt o grubun sohbeti, yoksa grup seçimi."""
+    uyelikler = (GrupUyeligi.query.options(db.joinedload(GrupUyeligi.grup))
+                 .filter_by(kullanici_id=current_user.id).all())
+    if len(uyelikler) == 1:
+        return redirect(url_for("grup_sohbet", grup_id=uyelikler[0].grup_id))
+    okunmamis = gruplara_gore_okunmamis(current_user.id)
+    son_mesajlar = {}
+    for u in uyelikler:
+        son = Mesaj.query.filter_by(grup_id=u.grup_id).order_by(Mesaj.id.desc()).first()
+        son_mesajlar[u.grup_id] = son.to_dict() if son else None
+    gruplar = sorted([u.grup for u in uyelikler],
+                     key=lambda g: (son_mesajlar[g.id] or {}).get("id", 0), reverse=True)
+    return render_template("sohbetler.html", gruplar=gruplar, okunmamis=okunmamis, son_mesajlar=son_mesajlar)
+
+
 @app.route("/admin/kullanicilar")
 @admin_required
 def admin_kullanicilar():
@@ -2654,6 +3067,8 @@ def admin_kullanici_sil(kullanici_id):
         return redirect(url_for("admin_kullanicilar"))
 
     Tahmin.query.filter_by(kullanici_id=kullanici.id).delete()
+    Mesaj.query.filter_by(kullanici_id=kullanici.id).delete()
+    SohbetOkuma.query.filter_by(kullanici_id=kullanici.id).delete()
     GrupUyeligi.query.filter_by(kullanici_id=kullanici.id).delete()
     kullanici_adi = kullanici.kullanici_adi
     db.session.delete(kullanici)
@@ -2744,7 +3159,7 @@ def team_logo(team_id):
         try:
             url = f"{SPORTAPI7_BASE_URL}/team/{team_id}/image"
             headers = {"X-RapidAPI-Key": SPORTAPI7_KEY, "X-RapidAPI-Host": SPORTAPI7_HOST}
-            response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
+            response = requests.get(url, headers=headers, timeout=LOGO_TIMEOUT)
             if response.status_code == 200:
                 veri = response.content
                 content_type = response.headers.get("Content-Type", "image/png")
@@ -2757,7 +3172,7 @@ def team_logo(team_id):
             logo_url = _thesportsdb_logo_url(takim_adi)
             if logo_url:
                 try:
-                    response = requests.get(logo_url, timeout=API_TIMEOUT)
+                    response = requests.get(logo_url, timeout=LOGO_TIMEOUT)
                     if response.status_code == 200:
                         veri = response.content
                         content_type = response.headers.get("Content-Type", "image/png")
@@ -2787,6 +3202,223 @@ def team_logo(team_id):
     return yanit
 
 
+# ============================================================
+# LİG PUAN TABLOSU
+# ============================================================
+# Süper Lig ve Şampiyonlar Ligi tablosu sitenin KENDİ maç verisinden hesaplanır
+# (ek API isteği yok, kota yok). Uluslar Ligi'nde sadece Türkiye maçları
+# tutulduğu için Türkiye'nin grubu ESPN'in standings uç noktasından çekilir.
+ESPN_STANDINGS_URL = "https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings"
+_PUAN_TABLOSU_ONBELLEK = {}
+PUAN_TABLOSU_ONBELLEK_SN = 30 * 60
+
+
+def _guncel_sezon_yili():
+    simdi = datetime.now(timezone.utc)
+    return simdi.year if simdi.month >= 7 else simdi.year - 1
+
+
+def lig_puan_tablosu_hesapla(lig_id):
+    """Biten maçlardan puan tablosu: [{sira, takim, logo, o, g, b, m, ag, yg, av, p, form}]"""
+    sorgu = Mac.query.filter(
+        Mac.lig_id == lig_id, Mac.durum == "bitti",
+        Mac.ev_skor.isnot(None), Mac.deplasman_skor.isnot(None),
+    )
+    sezon = _guncel_sezon_yili()
+    sorgu = sorgu.filter(db.or_(Mac.sezon == sezon, Mac.sezon.is_(None)))
+    maclar = sorgu.order_by(Mac.baslangic.asc()).all()
+
+    if lig_id == SUPER_LIG_ID:
+        # ESPN'e geçişten kalan eşleşmemiş eski kopyalar puanları iki kez saymasın
+        espn = [m for m in maclar if m.external_id and m.external_id >= ESPN_EXTERNAL_ID_OFFSET]
+        if espn:
+            maclar = espn
+    if lig_id == CHAMPIONS_LEAGUE_ID:
+        # Sadece lig aşaması (1-8. maç günü); eleme turları tabloya girmez
+        maclar = [m for m in maclar if m.hafta and str(m.hafta).isdigit() and 1 <= int(m.hafta) <= 8]
+
+    tablo = {}
+    def satir(ad, logo):
+        t = tablo.setdefault(ad, {"takim": ad, "logo": None, "o": 0, "g": 0, "b": 0, "m": 0, "ag": 0, "yg": 0, "form": []})
+        if logo:
+            t["logo"] = logo
+        return t
+    for m in maclar:
+        ev, dep = satir(m.ev_sahibi, m.ev_logo), satir(m.deplasman, m.deplasman_logo)
+        for t, at, ye in ((ev, m.ev_skor, m.deplasman_skor), (dep, m.deplasman_skor, m.ev_skor)):
+            t["o"] += 1; t["ag"] += at; t["yg"] += ye
+            sonuc = "G" if at > ye else ("B" if at == ye else "M")
+            t[{"G": "g", "B": "b", "M": "m"}[sonuc]] += 1
+            t["form"].append(sonuc)
+    satirlar = []
+    for t in tablo.values():
+        t["av"] = t["ag"] - t["yg"]
+        t["p"] = t["g"] * 3 + t["b"]
+        t["form"] = t["form"][-5:]
+        satirlar.append(t)
+    satirlar.sort(key=lambda t: (-t["p"], -t["av"], -t["ag"], t["takim"]))
+    for i, t in enumerate(satirlar, 1):
+        t["sira"] = i
+    return satirlar
+
+
+def _espn_turkiye_grubu():
+    """Uluslar Ligi'nde Türkiye'nin grubunu ESPN'den çeker (30 dk önbellek)."""
+    onbellek = _PUAN_TABLOSU_ONBELLEK.get("UNL")
+    if onbellek and (datetime.utcnow() - onbellek["zaman"]).total_seconds() < PUAN_TABLOSU_ONBELLEK_SN:
+        return onbellek["veri"]
+    yanit = requests.get(ESPN_STANDINGS_URL.format(slug=ESPN_NATIONS_LEAGUE_SLUG),
+                         headers={"Accept": "application/json"}, timeout=10)
+    yanit.raise_for_status()
+    veri = yanit.json()
+
+    def gruplar(dugum):
+        if isinstance(dugum, dict):
+            if (dugum.get("standings") or {}).get("entries"):
+                yield dugum
+            for c in dugum.get("children") or []:
+                yield from gruplar(c)
+
+    def stat(entry, *adlar):
+        for st in entry.get("stats") or []:
+            if st.get("name") in adlar or st.get("type") in adlar or st.get("abbreviation") in adlar:
+                try:
+                    return int(float(st.get("value") or 0))
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    for g in gruplar(veri):
+        entries = g["standings"]["entries"]
+        adlar = [((e.get("team") or {}).get("displayName") or "") for e in entries]
+        if not any(("Turk" in a) or ("Türk" in a) for a in adlar):
+            continue
+        satirlar = []
+        for e in entries:
+            takim = e.get("team") or {}
+            logolar = takim.get("logos") or []
+            ag, yg = stat(e, "pointsFor"), stat(e, "pointsAgainst")
+            satirlar.append({
+                "takim": takim.get("displayName") or "?", "logo": logolar[0].get("href") if logolar else None,
+                "o": stat(e, "gamesPlayed"), "g": stat(e, "wins"), "b": stat(e, "ties"), "m": stat(e, "losses"),
+                "ag": ag, "yg": yg, "av": stat(e, "pointDifferential") or (ag - yg), "p": stat(e, "points"),
+                "sira": stat(e, "rank"), "form": [],
+            })
+        satirlar.sort(key=lambda t: (t["sira"] or 99, -t["p"], -t["av"]))
+        for i, t in enumerate(satirlar, 1):
+            t["sira"] = i
+        sonuc = {"grup": g.get("name") or g.get("abbreviation") or "", "satirlar": satirlar}
+        _PUAN_TABLOSU_ONBELLEK["UNL"] = {"zaman": datetime.utcnow(), "veri": sonuc}
+        return sonuc
+    return None
+
+
+@app.route("/puan-durumu")
+@login_required
+def puan_durumu():
+    sekmeler = []
+    for kod, bilgi in LEAGUES.items():
+        if bilgi["id"] not in gosterilecek_lig_id_listesi():
+            continue
+        sekme = {"kod": kod, "ad": LIG_KISA_ADLARI.get(bilgi["id"], bilgi["ad"]), "satirlar": [], "not": None, "hata": None}
+        if bilgi["id"] == NATIONS_LEAGUE_ID:
+            try:
+                grup = _espn_turkiye_grubu()
+                if grup:
+                    sekme["satirlar"] = grup["satirlar"]
+                    sekme["not"] = f"Türkiye'nin grubu{(' (' + grup['grup'] + ')') if grup['grup'] else ''}"
+                else:
+                    sekme["hata"] = "Türkiye'nin grubu ESPN'de bulunamadı."
+            except Exception:
+                sekme["hata"] = "Uluslar Ligi tablosu şu an alınamadı. Biraz sonra tekrar dene."
+        else:
+            sekme["satirlar"] = lig_puan_tablosu_hesapla(bilgi["id"])
+            if bilgi["id"] == CHAMPIONS_LEAGUE_ID:
+                sekme["not"] = "Lig aşaması. İlk 8 son 16'ya, 9-24 arası play-off'a kalır."
+                sekme["bolgeler"] = {"yesil": range(1, 9), "sari": range(9, 25)}
+            else:
+                n = len(sekme["satirlar"])
+                sekme["not"] = "Son 3 takım küme düşer."
+                sekme["bolgeler"] = {"yesil": range(1, 2), "kirmizi": range(max(n - 2, 1), n + 1) if n >= 6 else range(0)}
+        sekmeler.append(sekme)
+    secili = request.args.get("lig") or (sekmeler[1]["kod"] if len(sekmeler) > 1 and sekmeler[1]["satirlar"] else (sekmeler[0]["kod"] if sekmeler else None))
+    return render_template("puan_durumu.html", sekmeler=sekmeler, secili=secili)
+
+
+# ------------------------------------------------------------
+# AKILLI OTOMATİK SENKRON
+# ------------------------------------------------------------
+# cron her 15 dk'da bir /cron/sync'i çağırır. API'lere SADECE sonucu
+# beklenen (başlamasının üzerinden MAC_BITIS_DAKIKA geçmiş ama hâlâ
+# "bitti" olmayan) bir maç varsa gidilir — ve sadece o maçın ligi / ayı
+# çekilir. Günde bir kez de tüm sezon taranır (ertelenen/yeni maçlar için).
+MAC_BITIS_DAKIKA = 105          # 90 dk + devre arası + uzatmalar
+BEKLEYEN_MAC_GERI_BAKIS_SAAT = 48
+TAM_SENKRON_ARALIK_SAAT = 24
+
+
+def _senkron_zamani_oku(ad):
+    kayit = db.session.get(SenkronKaydi, ad)
+    return kayit.zaman if kayit else None
+
+
+def _senkron_zamani_yaz(ad):
+    kayit = db.session.get(SenkronKaydi, ad)
+    if kayit is None:
+        db.session.add(SenkronKaydi(ad=ad, zaman=utc_now_naive()))
+    else:
+        kayit.zaman = utc_now_naive()
+    db.session.commit()
+
+
+def sonucu_beklenen_maclar(now=None):
+    now = now or utc_now_naive()
+    return Mac.query.filter(
+        Mac.lig_id.in_(TAKIP_EDILEN_LIG_ID_LISTESI),
+        Mac.baslangic.isnot(None),
+        Mac.baslangic <= now - timedelta(minutes=MAC_BITIS_DAKIKA),
+        Mac.baslangic >= now - timedelta(hours=BEKLEYEN_MAC_GERI_BAKIS_SAAT),
+        ~Mac.durum.in_(["bitti", "iptal", "ertelendi"]),
+        db.or_(Mac.api_status.is_(None), Mac.api_status != "MANUEL"),
+    ).all()
+
+
+def akilli_senkron():
+    now = utc_now_naive()
+
+    son_tam = _senkron_zamani_oku("tam")
+    if son_tam is None or (now - son_tam) >= timedelta(hours=TAM_SENKRON_ARALIK_SAAT):
+        sonuclar = sync_all_leagues()
+        _senkron_zamani_yaz("tam")
+        return {"tur": "tam (günlük)", "sonuclar": sonuclar}
+
+    bekleyenler = sonucu_beklenen_maclar(now)
+    if not bekleyenler:
+        return {"tur": "atlandı", "mesaj": "Sonucu beklenen maç yok, API'ye gidilmedi."}
+
+    lig_id_to_kod = {bilgi["id"]: kod for kod, bilgi in LEAGUES.items()}
+    lig_aylari = {}
+    for m in bekleyenler:
+        kod = lig_id_to_kod.get(m.lig_id)
+        if kod:
+            # Türkiye saatiyle ay sınırına denk gelen maçlar için hem UTC hem TR ayı
+            for t in (m.baslangic, m.baslangic + timedelta(hours=3)):
+                lig_aylari.setdefault(kod, set()).add((t.year, t.month))
+
+    sonuclar = {}
+    for kod, aylar in lig_aylari.items():
+        try:
+            sonuclar[kod] = sync_league(kod, aylar=sorted(aylar))
+        except Exception as e:
+            db.session.rollback()
+            sonuclar[kod] = {"success": False, "error": str(e)}
+    return {
+        "tur": "bekleyen maçlar",
+        "bekleyen": [f"{m.ev_sahibi} - {m.deplasman}" for m in bekleyenler],
+        "sonuclar": sonuclar,
+    }
+
+
 @app.route("/cron/sync", methods=["GET", "POST"])
 def cron_sync():
     """
@@ -2803,9 +3435,17 @@ def cron_sync():
     if gelen_secret != beklenen_secret:
         abort(403)
 
+    if request.args.get("tam") == "1":
+        try:
+            sonuclar = sync_all_leagues()
+            _senkron_zamani_yaz("tam")
+            return jsonify({"tur": "tam", "sonuclar": sonuclar}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"success": False, "error": str(e)}), 500
+
     try:
-        sonuclar = sync_all_leagues()
-        return jsonify(sonuclar), 200
+        return jsonify(akilli_senkron()), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
