@@ -10,8 +10,11 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet">
 
-<!-- Google AdSense (Auto Ads) -->
+<!-- Google AdSense (Auto Ads): giriş/kayıt, sohbet ve admin sayfalarında YÜKLENMEZ (içeriksiz ve kullanıcı içerikli sayfalar) -->
+{% set _ep = request.endpoint or "" %}
+{% if not (_ep in ('giris', 'kayit', 'cikis', 'sohbetler', 'grup_sohbet', 'tahmin') or _ep.startswith('admin') or _ep == 'static') %}
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3716423648799781" crossorigin="anonymous"></script>
+{% endif %}
 
 <style>
 /* ============================================================
@@ -129,6 +132,18 @@ p{margin:0 0 .75em}
 .ust-rozet{display:inline-block; min-width:20px; height:20px; padding:0 6px; margin-left:2px; border-radius:999px; background:var(--kirmizi); color:#fff; font:700 13px/20px var(--baslik); text-align:center}
 .tab-ikon{position:relative; display:inline-flex}
 .tab-rozet{position:absolute; top:-6px; left:14px; min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:var(--kirmizi); color:#fff; font:700 12px/18px var(--baslik); text-align:center; box-shadow:0 0 0 2px #fff}
+
+/* ---------- Girişsiz üst menü ve alt bilgi ---------- */
+.ustmenu-acik{display:flex; align-items:center; gap:4px}
+.ustmenu-acik a:not(.btn){color:var(--gri); text-decoration:none; font-weight:600; font-size:15px; padding:8px 12px; border-radius:var(--r-kucuk)}
+.ustmenu-acik a:not(.btn):hover{color:var(--murekkep); background:var(--zemin)}
+.ustmenu-acik a[aria-current="page"]{color:var(--cim); background:var(--cim-acik)}
+@media (max-width:640px){ .gizle-mobil{display:none} }
+.altbilgi{max-width:760px; margin:0 auto; padding:8px 16px 32px; color:var(--gri); font-size:14px}
+.altbilgi nav{display:flex; flex-wrap:wrap; gap:6px 18px; padding-top:16px; border-top:1px solid var(--cizgi); margin-bottom:8px}
+.altbilgi a{color:var(--gri); font-weight:600; text-decoration:none}
+.altbilgi a:hover{color:var(--cim)}
+.altbilgi p{margin:0; font-size:13px}
 /* ---------- Sayfa ---------- */
 .sayfa{max-width:760px; margin:0 auto; padding:24px 16px 48px}
 .sayfa-bas{display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:20px}
@@ -296,7 +311,7 @@ tr:last-child td{border-bottom:0}
 
 <header class="appbar">
   <div class="appbar-ic">
-    <a class="marka" href="{{ url_for('dashboard') if current_user.is_authenticated else url_for('giris') }}">
+    <a class="marka" href="{{ url_for('dashboard') if current_user.is_authenticated else url_for('index') }}">
       <span class="marka-isaret" aria-hidden="true"></span>Tahmin Ligi
     </a>
     {% if current_user.is_authenticated %}
@@ -308,6 +323,12 @@ tr:last-child td{border-bottom:0}
       <a href="{{ url_for('sohbetler') }}" {% if sohbette %}aria-current="page"{% endif %}>Sohbet{% if toplam_okunmamis %} <span class="ust-rozet">{{ toplam_okunmamis }}</span>{% endif %}</a>
       {% if current_user.admin %}<a href="{{ url_for('admin') }}" {% if ep.startswith('admin') %}aria-current="page"{% endif %}>Admin</a>{% endif %}
       <a href="{{ url_for('cikis') }}">Çıkış</a>
+    </nav>
+    {% else %}
+    <nav class="ustmenu-acik" aria-label="Ana menü">
+      <a class="gizle-mobil" href="{{ url_for('puan_durumu') }}" {% if ep == 'puan_durumu' %}aria-current="page"{% endif %}>Puan durumu</a>
+      <a class="gizle-mobil" href="{{ url_for('nasil_oynanir') }}" {% if ep == 'nasil_oynanir' %}aria-current="page"{% endif %}>Nasıl oynanır</a>
+      {% if ep != 'giris' %}<a class="btn btn-kucuk" href="{{ url_for('giris') }}">Giriş yap</a>{% endif %}
     </nav>
     {% endif %}
   </div>
@@ -322,6 +343,16 @@ tr:last-child td{border-bottom:0}
 
   {% block content %}{% endblock %}
 </main>
+
+<footer class="altbilgi">
+  <nav aria-label="Site bağlantıları">
+    <a href="{{ url_for('puan_durumu') }}">Puan durumu</a>
+    <a href="{{ url_for('nasil_oynanir') }}">Nasıl oynanır</a>
+    <a href="{{ url_for('gizlilik') }}">Gizlilik</a>
+    <a href="{{ url_for('iletisim') }}">İletişim</a>
+  </nav>
+  <p>Tahmin Ligi arkadaş grupları için parasız bir skor tahmin oyunudur. Bahis veya para ödülü yoktur.</p>
+</footer>
 
 {% if current_user.is_authenticated %}
 <nav class="tabbar" aria-label="Alt menü">

@@ -1875,9 +1875,61 @@ def ads_txt():
 
 @app.route("/")
 def index():
+    """Girişli kullanıcı panele gider; girişsiz ziyaretçi herkese açık tanıtım sayfasını görür."""
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
-    return redirect(url_for("giris"))
+    try:
+        ozet = lig_puan_tablosu_hesapla(SUPER_LIG_ID)[:6]
+    except Exception:
+        db.session.rollback()
+        ozet = []
+    now = utc_now_naive()
+    yaklasan = Mac.query.filter(
+        Mac.lig_id.in_(gosterilecek_lig_id_listesi()), Mac.baslangic.isnot(None), Mac.baslangic > now,
+        ~Mac.durum.in_(["bitti", "iptal", "ertelendi"]),
+    ).order_by(Mac.baslangic.asc()).limit(5).all()
+    return render_template("anasayfa.html", ozet=ozet, yaklasan=yaklasan)
+
+
+# ------------------------------------------------------------
+# HERKESE AÇIK BİLGİ SAYFALARI
+# ------------------------------------------------------------
+ILETISIM_EPOSTA = os.getenv("ILETISIM_EPOSTA", "").strip()
+
+
+@app.route("/nasil-oynanir")
+def nasil_oynanir():
+    return render_template("nasil_oynanir.html")
+
+
+@app.route("/gizlilik")
+def gizlilik():
+    return render_template("gizlilik.html", iletisim_eposta=ILETISIM_EPOSTA)
+
+
+@app.route("/iletisim")
+def iletisim():
+    return render_template("iletisim.html", iletisim_eposta=ILETISIM_EPOSTA)
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    satirlar = [
+        "User-agent: *",
+        "Allow: /$", "Allow: /puan-durumu", "Allow: /nasil-oynanir", "Allow: /gizlilik", "Allow: /iletisim",
+        "Disallow: /admin", "Disallow: /cron", "Disallow: /grup", "Disallow: /sohbet", "Disallow: /api",
+        "", f"Sitemap: {request.url_root.rstrip('/')}/sitemap.xml",
+    ]
+    return Response("\n".join(satirlar) + "\n", mimetype="text/plain")
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    kok = request.url_root.rstrip("/")
+    sayfalar = ["/", "/puan-durumu", "/nasil-oynanir", "/gizlilik", "/iletisim"]
+    govde = "".join(f"<url><loc>{kok}{s}</loc></url>" for s in sayfalar)
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{govde}</urlset>'
+    return Response(xml, mimetype="application/xml")
 
 
 @app.route("/kayit", methods=["GET", "POST"])
@@ -3314,8 +3366,8 @@ def _espn_turkiye_grubu():
 
 
 @app.route("/puan-durumu")
-@login_required
 def puan_durumu():
+    """Herkese açık: girişsiz ziyaretçiler de liglerin puan tablosunu görebilir."""
     sekmeler = []
     for kod, bilgi in LEAGUES.items():
         if bilgi["id"] not in gosterilecek_lig_id_listesi():
