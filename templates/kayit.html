@@ -3,77 +3,29 @@
 {% block title %}Kayıt · Tahmin Ligi{% endblock %}
 
 {% block content %}
+<div class="giris-alani">
+  <div class="giris-bas">
+    <h1>Tahmin Ligi</h1>
+    <p class="alt sessiz">Hesabını aç, arkadaşının davet koduyla gruba katıl.</p>
+  </div>
 
-<div style="max-width: 450px; margin: 40px auto;">
+  <section class="panel">
+    <h2>Hesap oluştur</h2>
+    <form method="POST">
+      {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}">{% endif %}
+      <label for="kullanici_adi">Kullanıcı adı</label>
+      <input id="kullanici_adi" name="kullanici_adi" required minlength="3" maxlength="30" autocomplete="username" autocapitalize="none" placeholder="Örn. huseyin">
+      <p class="ipucu">Grup sıralamasında bu isim görünür.</p>
+      <label for="sifre">Şifre</label>
+      <input id="sifre" type="password" name="sifre" required minlength="6" autocomplete="new-password">
+      <label for="sifre_tekrar">Şifre tekrar</label>
+      <input id="sifre_tekrar" type="password" name="sifre_tekrar" required minlength="6" autocomplete="new-password">
+      <p class="ipucu">En az 6 karakter.</p>
+      <button type="submit" class="btn btn-blok">Hesap oluştur</button>
+    </form>
+  </section>
 
-    <div class="card">
-
-        <h1 style="text-align: center; margin-bottom: 20px;">
-            Hesap Oluştur
-        </h1>
-
-        <p style="text-align: center; color: #666; margin-bottom: 20px;">
-            Arkadaşlarınla tahmin yarışına katıl.
-        </p>
-
-        <form method="POST">
-
-            {% if next_url %}
-            <input type="hidden" name="next" value="{{ next_url }}">
-            {% endif %}
-
-            <label>
-                Kullanıcı adı
-            </label>
-
-            <input 
-                name="kullanici_adi"
-                required
-                minlength="3"
-                maxlength="30"
-                autocomplete="username"
-                placeholder="Örn. Huseyin"
-            >
-
-            <label>
-                Şifre
-            </label>
-
-            <input 
-                type="password"
-                name="sifre"
-                required
-                minlength="6"
-                autocomplete="new-password"
-            >
-
-            <label>
-                Şifre tekrar
-            </label>
-
-            <input 
-                type="password"
-                name="sifre_tekrar"
-                required
-                minlength="6"
-                autocomplete="new-password"
-            >
-
-            <button class="btn" style="width: 100%; margin-top: 10px;">
-                Hesap Oluştur
-            </button>
-
-        </form>
-
-        <div style="text-align: center; margin-top: 20px; font-size: 0.9em;">
-            Zaten hesabın var mı? 
-            <a href="{{ url_for('giris') }}" style="color: #2563eb; text-decoration: none;">
-                Giriş yap
-            </a>
-        </div>
-
-    </div>
-
+  <p class="giris-alt">Zaten hesabın var mı? <a href="{{ url_for('giris', next=next_url) if next_url else url_for('giris') }}">Giriş yap</a></p>
 </div>
-
+{% include "_giris_stil.html" %}
 {% endblock %}

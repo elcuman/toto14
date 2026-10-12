@@ -1,54 +1,31 @@
 {% extends "base.html" %}
+{% import "_parcalar.html" as p with context %}
+
+{% block title %}Haftalık sıralama · {{ grup.ad }}{% endblock %}
 
 {% block content %}
+<a class="geri" href="{{ url_for('grup', grup_id=grup.id) }}">‹ {{ grup.ad }}</a>
 
-<h1>📅 Haftalık Zirve Listesi — {{ grup.ad }}</h1>
-
-<p style="color:var(--muted); margin-top:-6px;">
-  Her hafta puanlar sıfırdan başlar; burada geçmişteki her haftanın kendi lider tablosunu görebilirsin.
-  <a href="{{ url_for('grup', grup_id=grup.id) }}">← Gruba dön</a>
-</p>
+<div class="sayfa-bas">
+  <div>
+    <h1>Haftalık sıralama</h1>
+    <p class="alt">Her hafta puanlar sıfırdan başlar. Geçmiş haftaların kralları ve cenabetleri burada.</p>
+  </div>
+</div>
 
 {% if haftalik_liderlik %}
   {% for hafta_verisi in haftalik_liderlik %}
-    <div class="card">
+  <section class="panel">
+    <div class="panel-bas">
       <h2>
-        {% if hafta_verisi.hafta_basi %}
-          Hafta: {{ hafta_verisi.hafta_basi | tr_saat("%d.%m.%Y") }} — {{ hafta_verisi.hafta_sonu | tr_saat("%d.%m.%Y") }}
-        {% else %}
-          Tarihsiz Maçlar
-        {% endif %}
-        {% if hafta_verisi.lider %}
-          <span style="font-size:0.6em; color:var(--gold); font-weight:700;">
-            👑 Haftanın Lideri: {{ hafta_verisi.lider.user.kullanici_adi }} ({{ hafta_verisi.lider.points }} puan)
-          </span>
-        {% endif %}
+        {% if hafta_verisi.hafta_basi %}{{ hafta_verisi.hafta_basi | tr_saat("%d.%m") }} – {{ hafta_verisi.hafta_sonu | tr_saat("%d.%m.%Y") }}{% else %}Tarihsiz maçlar{% endif %}
       </h2>
-
-      <table class="table">
-        <tr><th>#</th><th>Kullanıcı</th><th>Bu Haftaki Puan</th></tr>
-        {% for row in hafta_verisi.siralama %}
-        <tr>
-          <td>
-            {{ loop.index }}
-            {% if loop.index == 1 %} 👑{% endif %}
-            {% if loop.index == loop.length and loop.length > 1 %} 💩{% endif %}
-          </td>
-          <td>
-            {{ row.user.kullanici_adi }}
-            {% if loop.index == 1 %}<span class="badge" style="background:#fff4d6;color:#8a6d00;">Haftanın Kralı</span>{% endif %}
-            {% if loop.index == loop.length and loop.length > 1 %}<span class="badge" style="background:#fde2e1;color:#9b1c1c;">Haftanın Cenabeti</span>{% endif %}
-          </td>
-          <td><strong>{{ row.points }}</strong></td>
-        </tr>
-        {% endfor %}
-      </table>
+      {% if hafta_verisi.lider %}<span class="yan">Lider: <strong>{{ hafta_verisi.lider.user.kullanici_adi }}</strong></span>{% endif %}
     </div>
+    {{ p.siralama(hafta_verisi.siralama, "Haftanın kralı", "Haftanın cenabeti", "Puan") }}
+  </section>
   {% endfor %}
 {% else %}
-  <div class="card">
-    <p class="text-muted">Henüz bitmiş bir hafta yok. İlk hafta sona erdiğinde burada listelenecek.</p>
-  </div>
+  <div class="bos"><strong>Henüz biten hafta yok.</strong>İlk hafta bitince sıralaması burada görünecek.</div>
 {% endif %}
-
 {% endblock %}
